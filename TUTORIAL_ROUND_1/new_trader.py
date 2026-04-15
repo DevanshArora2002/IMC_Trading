@@ -193,7 +193,7 @@ class StaticTrader(ProductTrader):
             for sp, sv in self.mkt_sell_orders.items(): ## Getting the number of open sell orders in the market
                 if sp <= self.wall_mid - 1:  ### Checking if the given sell price is present between the mid wall of the following
                     self.bid(sp, sv, logging=False)
-                elif sp <= self.wall_mid and self.initial_position < 0:
+                elif sp <= self.wall_mid and self.initial_position < 0:  ## If the price is not favourable then will buy the quantity to exit from the short position
                         volume = min(sv,  abs(self.initial_position))
                         self.bid(sp, volume, logging=False)
 
@@ -206,6 +206,8 @@ class StaticTrader(ProductTrader):
 
             ###########################################################
             ####### 2. MAKING
+            ### Overall the purpose of this is to generate pressure in the market by selling above the maximum 
+            ## possible sell and buying below the minimum possible buy and create the market conditions in one's favour
             ###########################################################
             bid_price = int(self.bid_wall + 1) # base case
             ask_price = int(self.ask_wall - 1) # base case
@@ -236,3 +238,46 @@ class StaticTrader(ProductTrader):
 
 
         return {self.name: self.orders}
+
+STATIC_SYMBOL = "EMERALDS"
+POS_LIMITS = {
+    STATIC_SYMBOL: 20, 
+}
+
+class Trader:
+
+    def run(self, state: TradingState):
+        result:dict[str,list[Order]] = {}
+        new_trader_data = {}
+        prints = {
+            "GENERAL": {
+                "TIMESTAMP": state.timestamp,
+                "POSITIONS": state.position
+            },
+        }
+
+        def export(prints):
+            try: print(json.dumps(prints))
+            except: pass
+
+
+        product_traders = {
+            STATIC_SYMBOL: StaticTrader
+        }
+
+        result, conversions = {}, 0
+        for symbol, product_trader in product_traders.items():
+            if symbol in state.order_depths:
+
+                try:
+                    trader = product_trader(state, prints, new_trader_data)
+                    result.update(trader.get_orders())
+
+
+
+        try: final_trader_data = json.dumps(new_trader_data)
+        except: final_trader_data = ''
+
+
+        export(prints)
+        return result, 0, final_trader_data
