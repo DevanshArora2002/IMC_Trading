@@ -9,10 +9,13 @@ OSMIUM = "ASH_COATED_OSMIUM"
 POSITION_LIMIT = 80
 
 OSMIUM_ANCHOR = 10_000
-OSMIUM_EMA_ALPHA = 0.05
 OSMIUM_ANCHOR_WEIGHT = 0.5
 OSMIUM_EMA_WEIGHT = 0.5
-OSMIUM_HISTORY_WINDOW = 100
+
+OSMIUM_EMA_FAST_ALPHA = 0.15
+OSMIUM_EMA_SLOW_ALPHA = 0.05
+OSMIUM_Z_ENTRY = 1.5
+OSMIUM_Z_WINDOW = 40
 
 
 class Trader:
@@ -56,33 +59,13 @@ class Trader:
         order_depth: OrderDepth = state.order_depths[PEPPER]
 
         max_buy = POSITION_LIMIT - position
-        if max_buy <= 0:
+        if max_buy <= 0 or not order_depth.sell_orders:
             return orders
 
-        bought = 0
-
-        sell_orders = sorted(order_depth.sell_orders.items())
-        for ask_price, ask_vol in sell_orders:
-            if bought >= max_buy:
-                break
-            can_buy = min(abs(ask_vol), max_buy - bought)
-            if can_buy > 0:
-                orders.append(Order(PEPPER, ask_price, can_buy))
-                bought += can_buy
-
-        remaining = max_buy - bought
-        if remaining > 0:
-            best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else None
-            best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else None
-
-            if best_bid is not None and best_ask is not None:
-                passive_price = best_ask - 1
-            elif best_bid is not None:
-                passive_price = best_bid + 1
-            else:
-                passive_price = 10_000
-
-            orders.append(Order(PEPPER, passive_price, remaining))
+        best_ask = min(order_depth.sell_orders.keys())
+        vol = min(abs(order_depth.sell_orders[best_ask]), max_buy)
+        if vol > 0:
+            orders.append(Order(PEPPER, best_ask, vol))
 
         return orders
 
@@ -97,60 +80,73 @@ class Trader:
         if mid_price is None:
             return orders
 
-        ema = trader_state.get("osmium_ema", mid_price)
-        history = trader_state.get("osmium_history", [])
+        # ── state: read persisted indicators ──
+        ema_fast = trader_state.get("osmium_ema_fast", mid_price)
+        ema_slow = trader_state.get("osmium_ema_slow", mid_price)
+        history: list[float] = trader_state.get("osmium_history", [])
 
-        ema = OSMIUM_EMA_ALPHA * mid_price + (1 - OSMIUM_EMA_ALPHA) * ema
+        # ── update indicators ──
+        ema_fast = OSMIUM_EMA_FAST_ALPHA * mid_price + (1 - OSMIUM_EMA_FAST_ALPHA) * ema_fast
+        ema_slow = OSMIUM_EMA_SLOW_ALPHA * mid_price + (1 - OSMIUM_EMA_SLOW_ALPHA) * ema_slow
+
         history.append(mid_price)
-        if len(history) > OSMIUM_HISTORY_WINDOW:
-            history = history[-OSMIUM_HISTORY_WINDOW:]
+        if len(history) > OSMIUM_Z_WINDOW:
+            history = history[-OSMIUM_Z_WINDOW:]
 
-        trader_state["osmium_ema"] = ema
+        # ── persist state ──
+        trader_state["osmium_ema_fast"] = ema_fast
+        trader_state["osmium_ema_slow"] = ema_slow
         trader_state["osmium_history"] = history
 
-        fair_value = OSMIUM_ANCHOR_WEIGHT * OSMIUM_ANCHOR + OSMIUM_EMA_WEIGHT * ema
+        # ── z-score ──
+        if len(history) >= 2:
+            h_mean = sum(history) / len(history)
+            h_var = sum((x - h_mean) ** 2 for x in history) / len(history)
+            h_std = math.sqrt(h_var) if h_var > 0 else 1e-9
+            z_score = (mid_price - h_mean) / h_std
+        else:
+            z_score = 0.0
+
+        # ── reversal signals ──
+        # buy_signal = (z_score < -OSMIUM_Z_ENTRY) and (ema_fast > ema_slow) and (mid_price > ema_fast)
+        buy_signal = (ema_fast > ema_slow) and (mid_price > ema_fast)
+        # sell_signal = (z_score > OSMIUM_Z_ENTRY) and (ema_fast < ema_slow) and (mid_price < ema_fast)
+        sell_signal = (ema_fast < ema_slow) and (mid_price < ema_fast)
+
+        fair_value = OSMIUM_ANCHOR_WEIGHT * OSMIUM_ANCHOR + OSMIUM_EMA_WEIGHT * ema_slow
 
         max_buy = POSITION_LIMIT - position
         max_sell = POSITION_LIMIT + position
         bought = 0
         sold = 0
 
-        # ── taking: sweep all levels below/above fair value ──
-        sell_orders = sorted(order_depth.sell_orders.items())
-        for ask_price, ask_vol in sell_orders:
-            if ask_price > fair_value - 1:
-                if ask_price <= fair_value and position < 0:
-                    vol = min(abs(ask_vol), max_buy - bought, abs(position) - bought)
-                    if vol > 0:
-                        orders.append(Order(OSMIUM, ask_price, vol))
-                        bought += vol
-                break
-            can_buy = min(abs(ask_vol), max_buy - bought)
-            if can_buy > 0:
-                orders.append(Order(OSMIUM, ask_price, can_buy))
-                bought += can_buy
+        # ── taking: only when a reversal signal fires ──
+        if buy_signal:
+            sell_orders = sorted(order_depth.sell_orders.items())
+            for ask_price, ask_vol in sell_orders:
+                if ask_price > fair_value:
+                    break
+                can_buy = min(abs(ask_vol), max_buy - bought)
+                if can_buy > 0:
+                    orders.append(Order(OSMIUM, ask_price, can_buy))
+                    bought += can_buy
 
-        buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
-        for bid_price, bid_vol in buy_orders:
-            if bid_price < fair_value + 1:
-                if bid_price >= fair_value and position > 0:
-                    vol = min(abs(bid_vol), max_sell - sold, position - sold)
-                    if vol > 0:
-                        orders.append(Order(OSMIUM, bid_price, -vol))
-                        sold += vol
-                break
-            can_sell = min(abs(bid_vol), max_sell - sold)
-            if can_sell > 0:
-                orders.append(Order(OSMIUM, bid_price, -can_sell))
-                sold += can_sell
+        if sell_signal:
+            buy_orders = sorted(order_depth.buy_orders.items(), reverse=True)
+            for bid_price, bid_vol in buy_orders:
+                if bid_price < fair_value:
+                    break
+                can_sell = min(abs(bid_vol), max_sell - sold)
+                if can_sell > 0:
+                    orders.append(Order(OSMIUM, bid_price, -can_sell))
+                    sold += can_sell
 
-        # ── making: tight market around fair value ──
+        # ── making: tight passive quotes every tick ──
         bid_price = int(math.floor(fair_value)) - 1
         ask_price = int(math.ceil(fair_value)) + 1
         if bid_price == ask_price:
             ask_price += 1
 
-        # Overbid/underbid if profitable
         if order_depth.buy_orders:
             best_bid = max(order_depth.buy_orders.keys())
             overbid = best_bid + 1
