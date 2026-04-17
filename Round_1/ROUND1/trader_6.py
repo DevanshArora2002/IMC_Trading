@@ -8,7 +8,7 @@ OSMIUM = "ASH_COATED_OSMIUM"
 
 POSITION_LIMIT = 80
 
-# ── OSMIUM tunables (regime-aware mean reversion + stop-loss) ──────────
+# ── OSMIUM tunables (regime-aware mean reversion + inventory skew) ─────
 OSMIUM_ANCHOR = 10_000
 OSMIUM_ANCHOR_BAND = 1.5          # ticks; soft anchor only inside this band
 OSMIUM_EMA_FAST_ALPHA = 0.20
@@ -18,16 +18,12 @@ OSMIUM_WARMUP_TICKS = 20          # maker-only until warm
 
 # Stop-loss trigger family switch: "ema_cross_consec" | "rolling_drop" | "zscore_neg" | "none"
 # Winner from trader_6_backtest.ipynb (days -2,-1,0, taker-only fill model):
-#   mode="none" ranked #1 (pnl_total=251,853.5 vs trader.py ref=251,935); every flush
-#   family underperformed because the taker-only sim doesn't reward maker fills, so
-#   crossing the spread to flush just burns the edge. Regime-aware fair + inventory
-#   skew alone match trader.py and retain downside protection via the skew pulling
-#   quotes down as inventory grows.
-OSMIUM_FLUSH_MODE = "none"
-OSMIUM_FLUSH_CONSEC = 5           # best within ema_cross_consec family (fallback)
-OSMIUM_FLUSH_W = 40               # window for rolling_drop / zscore_neg
-OSMIUM_FLUSH_DROP = 3             # ticks drop for rolling_drop
-OSMIUM_FLUSH_Z = 2.5              # best within zscore_neg family (fallback)
+#   mode="none" ranked #1 with osmium_total=13,551.5 across 3 days
+#   (day-2: 3710, day-1: 4861, day0: 4980; worst DD -1788).
+#   Every flush family produced negative OSMIUM PnL (-12k to -30k) because the
+#   taker-only model penalises spread-crossing. Regime-aware fair + inventory skew
+#   alone provide sufficient downside defence without the flush cost.
+#   Stop-loss code removed; kept as reference in trader_6_backtest.ipynb.
 
 
 class Trader:
@@ -74,15 +70,18 @@ class Trader:
         if max_buy <= 0 or not order_depth.sell_orders:
             return orders
 
-        
-        best_ask = min(order_depth.sell_orders.keys())
-        vol = min(abs(order_depth.sell_orders[best_ask]), max_buy)
-        if vol > 0:
-            orders.append(Order(PEPPER, best_ask, vol))
+        for ask_price, ask_vol in sorted(order_depth.sell_orders.items()):
+            vol = abs(ask_vol)
+            if vol > 0 and max_buy > 0:
+                buy_vol = min(vol, max_buy)
+                orders.append(Order(PEPPER, ask_price, buy_vol))
+                max_buy -= buy_vol
+                if max_buy <= 0:
+                    break
 
         return orders
 
-    # ── ASH_COATED_OSMIUM: regime-aware fair, inventory skew, stop-loss ─
+    # ── ASH_COATED_OSMIUM: regime-aware fair + inventory skew ──────────
 
     def _trade_osmium(self, state: TradingState, trader_state: dict) -> list[Order]:
         orders: list[Order] = []
@@ -96,19 +95,11 @@ class Trader:
         # ── read persisted state ──
         ema_fast = trader_state.get("osmium_ema_fast", mid_price)
         ema_slow = trader_state.get("osmium_ema_slow", mid_price)
-        mid_hist: list[float] = trader_state.get("osmium_mid_hist", [])
-        down_streak = int(trader_state.get("osmium_down_streak", 0))
-        up_streak = int(trader_state.get("osmium_up_streak", 0))
         warmup = int(trader_state.get("osmium_warmup", 0))
 
         # ── update indicators ──
         ema_fast = OSMIUM_EMA_FAST_ALPHA * mid_price + (1 - OSMIUM_EMA_FAST_ALPHA) * ema_fast
         ema_slow = OSMIUM_EMA_SLOW_ALPHA * mid_price + (1 - OSMIUM_EMA_SLOW_ALPHA) * ema_slow
-
-        mid_hist.append(mid_price)
-        max_window = max(OSMIUM_FLUSH_W, 60)
-        if len(mid_hist) > max_window:
-            mid_hist = mid_hist[-max_window:]
 
         warmup += 1
 
@@ -122,79 +113,15 @@ class Trader:
         # ── reference price with linear inventory skew ──
         ref = fair - OSMIUM_INV_SKEW_K * (position / POSITION_LIMIT)
 
-        # ── stop-loss trigger evaluation ──
-        # track down-streak: ema_fast < ema_slow AND mid < ema_fast
-        if ema_fast < ema_slow and mid_price < ema_fast:
-            down_streak += 1
-        else:
-            down_streak = 0
-        # symmetric up-streak for short-side flush
-        if ema_fast > ema_slow and mid_price > ema_fast:
-            up_streak += 1
-        else:
-            up_streak = 0
-
-        flush_long = False    # sell to flatten positive inventory
-        flush_short = False   # buy to flatten negative inventory
-
-        if warmup >= OSMIUM_WARMUP_TICKS and OSMIUM_FLUSH_MODE != "none":
-            if OSMIUM_FLUSH_MODE == "ema_cross_consec":
-                if down_streak >= OSMIUM_FLUSH_CONSEC and position > 0:
-                    flush_long = True
-                if up_streak >= OSMIUM_FLUSH_CONSEC and position < 0:
-                    flush_short = True
-            elif OSMIUM_FLUSH_MODE == "rolling_drop":
-                w = min(OSMIUM_FLUSH_W, len(mid_hist))
-                if w >= 2:
-                    window = mid_hist[-w:]
-                    w_max = max(window)
-                    w_min = min(window)
-                    if position > 0 and mid_price <= w_max - OSMIUM_FLUSH_DROP:
-                        flush_long = True
-                    if position < 0 and mid_price >= w_min + OSMIUM_FLUSH_DROP:
-                        flush_short = True
-            elif OSMIUM_FLUSH_MODE == "zscore_neg":
-                w = min(OSMIUM_FLUSH_W, len(mid_hist))
-                if w >= 2:
-                    window = mid_hist[-w:]
-                    m = sum(window) / w
-                    v = sum((x - m) ** 2 for x in window) / w
-                    s = math.sqrt(v) if v > 0 else 1e-9
-                    z = (mid_price - m) / s
-                    if position > 0 and z <= -OSMIUM_FLUSH_Z:
-                        flush_long = True
-                    if position < 0 and z >= OSMIUM_FLUSH_Z:
-                        flush_short = True
-
         # ── persist state ──
         trader_state["osmium_ema_fast"] = ema_fast
         trader_state["osmium_ema_slow"] = ema_slow
-        trader_state["osmium_mid_hist"] = mid_hist
-        trader_state["osmium_down_streak"] = down_streak
-        trader_state["osmium_up_streak"] = up_streak
         trader_state["osmium_warmup"] = warmup
 
         max_buy = POSITION_LIMIT - position
         max_sell = POSITION_LIMIT + position
         bought = 0
         sold = 0
-
-        # ── stop-loss: hard flush crossing the spread ──
-        if flush_long and order_depth.buy_orders and position > 0:
-            best_bid = max(order_depth.buy_orders.keys())
-            bid_vol = abs(order_depth.buy_orders[best_bid])
-            can_sell = min(bid_vol, position, max_sell - sold)
-            if can_sell > 0:
-                orders.append(Order(OSMIUM, best_bid, -can_sell))
-                sold += can_sell
-
-        if flush_short and order_depth.sell_orders and position < 0:
-            best_ask = min(order_depth.sell_orders.keys())
-            ask_vol = abs(order_depth.sell_orders[best_ask])
-            can_buy = min(ask_vol, -position, max_buy - bought)
-            if can_buy > 0:
-                orders.append(Order(OSMIUM, best_ask, can_buy))
-                bought += can_buy
 
         # ── warmup: skip aggressive taking; maker-only ──
         if warmup < OSMIUM_WARMUP_TICKS:

@@ -128,7 +128,7 @@ No EMAs, no Z-scores. Pure anchor trading:
 
 ---
 
-# trader_6.py — regime-aware OSMIUM with inventory skew + pluggable stop-loss
+# trader_6.py — regime-aware OSMIUM with inventory skew (stop-loss removed)
 
 ## Root cause fixed (from log `logs2/169826.json`, diagnosed against `trader.py`)
 
@@ -138,15 +138,18 @@ OSMIUM drew ~150 units while mid drifted 10002 → 9996 over `t=80000..84000` ca
 - Passive maker bid = `floor(fair_value)-1 = 9999` keeps absorbing the dip, inventory climbs to +80.
 - No inventory skew and no stop-loss → a pure mean-reverter bleeds on any 4–8 tick drift.
 
-`trader_6.py` keeps PEPPER identical to `trader.py` and rewrites OSMIUM.
+`trader_6.py` rewrites OSMIUM. PEPPER uses buy-and-hold sweeping all ask levels (fixed from initial version that had a `sell_orders` sign bug — volumes are stored negative, so `abs()` is required).
 
 ## State (`traderData`, OSMIUM only)
 
 - `osmium_ema_fast` (alpha = 0.20, faster than trader.py's 0.15 for quicker regime detection).
 - `osmium_ema_slow` (alpha = 0.05, same as trader.py).
-- `osmium_mid_hist` — rolling mid prices, length = `max(OSMIUM_FLUSH_W, 60)`.
-- `osmium_down_streak`, `osmium_up_streak` — consecutive-tick counters for `ema_cross_consec` family.
 - `osmium_warmup` — tick counter; strategy is maker-only until `warmup >= OSMIUM_WARMUP_TICKS` (default 20).
+
+## PEPPER logic
+
+- Buy-and-hold: sweep all ask levels, buying `min(abs(ask_vol), remaining_capacity)` at each price ascending. Never sells.
+- **Bug fixed:** original trader_6 checked `ask_vol > 0` but `sell_orders` values are negative by convention → PEPPER never traded. Now uses `abs(ask_vol)`.
 
 ## OSMIUM logic (per tick, after warm-up)
 
@@ -172,39 +175,37 @@ OSMIUM drew ~150 units while mid drifted 10002 → 9996 over `t=80000..84000` ca
 - Post `bid = floor(ref) - 1`, `ask = ceil(ref) + 1` with remaining capacity.
 - Peg to `best_bid + 1` or `best_ask - 1` when those improve on `ref`.
 
-### Stop-loss (pluggable, switched via `OSMIUM_FLUSH_MODE`)
+### Stop-loss — removed
 
-Three trigger families plus `"none"` baseline:
-
-1. `ema_cross_consec` — trigger when `ema_fast < ema_slow AND mid < ema_fast` for `FLUSH_CONSEC` consecutive ticks AND `position > 0`. Symmetric short-side.
-2. `rolling_drop` — trigger when `mid <= max(hist[-W:]) - FLUSH_DROP` AND `position > 0`.
-3. `zscore_neg` — trigger when rolling z-score over `W` window `<= -FLUSH_Z` AND `position > 0`.
-
-On trigger: sell `min(best_bid_volume, position)` at `best_bid` to flatten (cross the spread).
+Grid-searched 23 combos across 3 trigger families (`ema_cross_consec`, `rolling_drop`, `zscore_neg`) plus `"none"` baseline. Every flush family produced **negative** OSMIUM PnL (-12k to -30k total across 3 days) because the taker-only fill model penalises spread-crossing to flush. Stop-loss code has been removed from the trader; backtest details remain in `trader_6_backtest.ipynb`.
 
 ## Backtest results (`trader_6_backtest.ipynb`, days -2, -1, 0, taker-only fills)
 
-Reference: `trader.py` total 3-day PnL = 251,935.00.
+Reference: `trader.py` total 3-day PnL = 246,001 (osmium: 7,699; pepper: 238,302).
 
-Top of ranked grid (23 combos):
+### OSMIUM per-day breakdown (winner = no flush):
 
-| rank | combo | mode | params | osmium_total | pepper_total | pnl_total |
-|---|---|---|---|---|---|---|
-| 1 | none | none | — | 13,551.5 | 238,302.0 | **251,853.5** |
-| 2 | ema_cross_consec_c5 | ema_cross_consec | CONSEC=5 | -12,732.0 | 238,302.0 | 225,570.0 |
-| 3 | ema_cross_consec_c4 | ema_cross_consec | CONSEC=4 | -17,459.5 | 238,302.0 | 220,842.5 |
-| 4 | zscore_neg_w60_z2.5 | zscore_neg | W=60 Z=2.5 | -20,359.0 | 238,302.0 | 217,943.0 |
-| … | rolling_drop_w20_d2 | rolling_drop | W=20 DROP=2 | -30,181.0 | 238,302.0 | 208,121.0 |
+| day | pnl_osmium | max_dd_osmium |
+|---|---|---|
+| -2 | 3,710.5 | -1,628 |
+| -1 | 4,861.0 | -1,554 |
+|  0 | 4,980.0 | -1,788 |
+| **total** | **13,551.5** | |
 
-Every flush family underperforms the baseline in this sim because the taker-only fill model never gives us credit for maker fills, so any cross-the-spread flush only spends edge. Pepper contribution is constant at 238,302 across all combos (logic unchanged). Full results saved to `trader_6_grid_results.csv`.
+### Grid ranking (top 5 of 23, OSMIUM-only PnL):
 
-## Applied defaults
+| rank | combo | osmium_total |
+|---|---|---|
+| 1 | none | **13,551.5** |
+| 2 | ema_cross_consec_c5 | -12,732.0 |
+| 3 | ema_cross_consec_c4 | -17,459.5 |
+| 4 | zscore_neg_w60_z2.5 | -20,359.0 |
+| 5 | zscore_neg_w20_z2.5 | -20,562.5 |
 
-- `OSMIUM_FLUSH_MODE = "none"` (winning combo).
-- Fallback params for the non-winning families are kept pointing at their per-family best (CONSEC=5, W=40/DROP=3, W=40/Z=2.5) so flipping `OSMIUM_FLUSH_MODE` to any other string gives the best-known parameters out of the box.
+**Note:** initial backtest showed `pepper_total = 0.0` for all combos — caused by the `sell_orders` sign bug in PEPPER (now fixed). OSMIUM numbers above are valid.
 
 ## Open caveats
 
 - Taker-only fill model is strictly pessimistic vs the live engine. Expect real PnL higher than the table above.
-- The 150-unit live dip that motivated trader_6 is not strongly present in days -2/-1/0, so the flush trigger's real-world value is untested by the grid. The regime-aware `fair` + inventory skew still fire in those conditions and are the primary defence; `ema_cross_consec_c5` (best trigger that did something) is one toggle away if live logs show renewed drawdown.
-- PEPPER logic is byte-identical to trader.py; any PEPPER PnL difference vs trader.py in the table reflects noise in the sim (there is none — both show 238,302).
+- The 150-unit live dip that motivated trader_6 is not strongly present in days -2/-1/0, so extreme drawdown scenarios are not covered by the grid. The regime-aware `fair` + inventory skew are the primary defence.
+- PEPPER bug fix (abs() on sell_orders volumes) should recover the ~238k PEPPER PnL that was missing. Re-run backtest to confirm combined totals.
