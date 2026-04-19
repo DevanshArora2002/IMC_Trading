@@ -159,7 +159,7 @@ class Trader:
 
         room = POSITION_LIMIT - position - bought
         if room > 0:
-            orders.append(Order(PEPPER, int(math.floor(fair)), room))
+            orders.append(Order(PEPPER, int(0.95*math.floor(fair)), room))
 
         net_long = position + bought
         if net_long > 0:
@@ -169,6 +169,7 @@ class Trader:
 
         return orders
 
+    
     # ── ASH_COATED_OSMIUM: penny-jump market maker ────────────────────
     def _trade_osmium(self, state: TradingState, data: dict) -> list[Order]:
         orders: list[Order] = []
@@ -180,6 +181,19 @@ class Trader:
         best_ask = min(depth.sell_orders.keys())
         mid = (best_bid + best_ask) / 2.0
         spread = best_ask - best_bid
+
+        ask_prices_hist = data.get("ask_prices_hist", [])
+        bid_prices_hist = data.get("bid_prices_hist", [])
+
+        ask_prices_hist.append(best_ask)
+        bid_prices_hist.append(best_bid)
+        if len(ask_prices_hist) > MAX_HISTORY_LENGTH:
+            ask_prices_hist = ask_prices_hist[-MAX_HISTORY_LENGTH:]
+            bid_prices_hist = bid_prices_hist[-MAX_HISTORY_LENGTH:]
+        
+        
+
+
 
         # ── adaptive fair (EMA of mid) ────────────────────────────────
         prev = data.get("osmium_fair")
